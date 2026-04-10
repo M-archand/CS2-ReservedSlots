@@ -6,6 +6,7 @@ using CounterStrikeSharp.API.Modules.Admin;
 using System.Text.Json.Serialization;
 using CounterStrikeSharp.API.Modules.Timers;
 using Microsoft.Extensions.Logging;
+using CounterStrikeSharp.API.Modules.Cvars;
 
 namespace ReservedSlots;
 
@@ -19,6 +20,8 @@ public class ReservedSlotsConfig : BasePluginConfig
     [JsonPropertyName("Kick Immunity Type")] public int kickImmunity { get; set; } = 0;
     [JsonPropertyName("Kick Reason")] public int kickReason { get; set; } = 135;
     [JsonPropertyName("Kick Delay")] public int kickDelay { get; set; } = 5;
+    [JsonPropertyName("Joining Player Kick Delay")] public int joiningPlayerKickDelay { get; set; } = -1;
+    [JsonPropertyName("In-Server Player Kick Delay")] public int inServerPlayerKickDelay { get; set; } = -1;
     [JsonPropertyName("Kick Check Method")] public int kickCheckMethod { get; set; } = 0;
     [JsonPropertyName("Kick Type")] public int kickType { get; set; } = 0;
     [JsonPropertyName("Kick Players In Spectate")] public bool kickPlayersInSpectate { get; set; } = true;
@@ -30,7 +33,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
 {
     public override string ModuleName => "Reserved Slots";
     public override string ModuleAuthor => "Nocky (SourceFactory.eu)";
-    public override string ModuleVersion => "1.1.0";
+    public override string ModuleVersion => "1.2.0";
 
     public enum KickType
     {
@@ -58,6 +61,8 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
     public Dictionary<int, bool> reservedPlayers = new();
     public Dictionary<int, KickReason> waitingForKick = new();
     public ReservedSlotsConfig Config { get; set; } = new();
+    private int? _cachedVisibleMaxPlayers;
+
     public void OnConfigParsed(ReservedSlotsConfig config)
     {
         Config = config;
@@ -67,6 +72,13 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
 
     public override void Load(bool hotReload)
     {
+        RefreshVisibleMaxPlayers();
+
+        RegisterListener<Listeners.OnMapStart>(mapName =>
+        {
+            RefreshVisibleMaxPlayers();
+        });
+
         RegisterListener<Listeners.OnTick>(() =>
         {
             if (waitingForKick.Count > 0)
@@ -76,7 +88,9 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
                     var player = Utilities.GetPlayerFromSlot(item.Key);
                     if (player != null && player.IsValid)
                     {
-                        var kickMessage = item.Value == KickReason.ServerIsFull ? Localizer["Hud.ServerIsFull"] : Localizer["Hud.ReservedPlayerJoined"];
+                        var kickMessage = item.Value == KickReason.ServerIsFull
+                            ? Localizer["Hud.ServerIsFull"]
+                            : Localizer["Hud.ReservedPlayerJoined"];
                         player.PrintToCenterHtml(kickMessage);
                     }
                 }
@@ -132,7 +146,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
             if (Config.adminFlags.Count == 0 && Config.reservedFlags.Count == 0)
                 return HookResult.Continue;
 
-            int MaxPlayers = Server.MaxPlayers;
+            int maxPlayers = Server.MaxPlayers;
             var playerReservedType = GetPlayersReservedType(player);
             if (playerReservedType == ReservedType.VIP || playerReservedType == ReservedType.Admin)
                 SetKickImmunity(player, playerReservedType);
@@ -140,23 +154,11 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
             switch (Config.reservedSlotsMethod)
             {
                 case 1:
-                    if (GetPlayersCount() > MaxPlayers - Config.reservedSlots)
+                    if (GetPlayersCount() > maxPlayers - Config.reservedSlots)
                     {
                         if (playerReservedType == ReservedType.VIP)
                         {
-                            if ((Config.openSlot && GetPlayersCount() >= MaxPlayers) || !Config.openSlot && GetPlayersCount() > MaxPlayers)
-                                PerformKickCheckMethod(player);
-                        }
-                        else if (playerReservedType == ReservedType.None)
-                            PerformKick(player, KickReason.ServerIsFull);
-                    }
-                    break;
-                case 2:
-                    if (GetPlayersCount() - GetPlayersCountWithReservationFlag() > MaxPlayers - Config.reservedSlots)
-                    {
-                        if (playerReservedType == ReservedType.VIP)
-                        {
-                            if ((Config.openSlot && GetPlayersCount() >= MaxPlayers) || !Config.openSlot && GetPlayersCount() > MaxPlayers)
+                            if ((Config.openSlot && GetPlayersCount() >= maxPlayers) || !Config.openSlot && GetPlayersCount() > maxPlayers)
                                 PerformKickCheckMethod(player);
                         }
                         else if (playerReservedType == ReservedType.None)
@@ -164,8 +166,25 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
                     }
                     break;
 
+                case 2:
+                    if (GetPlayersCount() - GetPlayersCountWithReservationFlag() > maxPlayers - Config.reservedSlots)
+                    {
+                        if (playerReservedType == ReservedType.VIP)
+                        {
+                            if ((Config.openSlot && GetPlayersCount() >= maxPlayers) || !Config.openSlot && GetPlayersCount() > maxPlayers)
+                                PerformKickCheckMethod(player);
+                        }
+                        else if (playerReservedType == ReservedType.None)
+                            PerformKick(player, KickReason.ServerIsFull);
+                    }
+                    break;
+
+                case 3:
+                    HandleOverflowModeJoin(player, playerReservedType, maxPlayers);
+                    break;
+
                 default:
-                    if (GetPlayersCount() >= MaxPlayers)
+                    if (GetPlayersCount() >= maxPlayers)
                     {
                         if (playerReservedType == ReservedType.VIP)
                             PerformKickCheckMethod(player);
@@ -191,8 +210,8 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         if (Config.adminFlags.Any())
         {
             var reservedFlags = Config.adminFlags
-            .Where(item => !ulong.TryParse(item, out _))
-            .ToHashSet();
+                .Where(item => !ulong.TryParse(item, out _))
+                .ToHashSet();
 
             if (playerFlags.Any(flag => reservedFlags.Contains(flag)))
                 return ReservedType.Admin;
@@ -201,8 +220,8 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         if (Config.reservedFlags.Any())
         {
             var reservedFlags = Config.reservedFlags
-            .Where(item => !ulong.TryParse(item, out _))
-            .ToHashSet();
+                .Where(item => !ulong.TryParse(item, out _))
+                .ToHashSet();
 
             if (playerFlags.Any(flag => reservedFlags.Contains(flag)))
                 return ReservedType.VIP;
@@ -241,7 +260,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
                 }
                 else
                 {
-                    Logger.LogWarning($"[Reserved Slots] Selected player is NULL, no one is kicked!");
+                    Logger.LogWarning("[Reserved Slots] Selected player is NULL, no one is kicked!");
                 }
                 break;
         }
@@ -254,17 +273,20 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
 
         var name = player.PlayerName;
         var steamid = player.SteamID.ToString();
-        if (Config.kickDelay > 1)
+        int delay = GetKickDelay(reason);
+
+        if (delay > 1)
         {
             var slot = player.Slot;
-            waitingForKick.Add(slot, reason);
-            AddTimer(Config.kickDelay, () =>
+            if (!waitingForKick.ContainsKey(slot))
+                waitingForKick.Add(slot, reason);
+
+            AddTimer(delay, () =>
             {
                 player = Utilities.GetPlayerFromSlot(slot);
                 if (player != null && player.IsValid)
                 {
                     player.Disconnect((CounterStrikeSharp.API.ValveConstants.Protobuf.NetworkDisconnectionReason)Config.kickReason);
-                    //Server.ExecuteCommand($"kickid {player.UserId}");
                     LogMessage(name, steamid, reason);
                 }
 
@@ -276,9 +298,18 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         else
         {
             player.Disconnect((CounterStrikeSharp.API.ValveConstants.Protobuf.NetworkDisconnectionReason)Config.kickReason);
-            //Server.ExecuteCommand($"kickid {player.UserId}");
             LogMessage(name, steamid, reason);
         }
+    }
+
+    private int GetKickDelay(KickReason reason)
+    {
+        return reason switch
+        {
+            KickReason.ServerIsFull when Config.joiningPlayerKickDelay >= 0 => Config.joiningPlayerKickDelay,
+            KickReason.ReservedPlayerJoined when Config.inServerPlayerKickDelay >= 0 => Config.inServerPlayerKickDelay,
+            _ => Config.kickDelay
+        };
     }
 
     public void LogMessage(string name, string steamid, KickReason reason)
@@ -315,6 +346,65 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
                 }
                 break;
         }
+    }
+
+    private void HandleOverflowModeJoin(CCSPlayerController player, ReservedType playerReservedType, int maxPlayers)
+    {
+        int publicSlots = GetPublicSlots(maxPlayers);
+        int joinThreshold = Config.openSlot ? publicSlots - 1 : publicSlots;
+        if (joinThreshold < 0)
+            joinThreshold = 0;
+
+        int totalPlayers = GetPlayersCount();
+
+        if (totalPlayers <= joinThreshold)
+            return;
+
+        if (playerReservedType == ReservedType.VIP || playerReservedType == ReservedType.Admin)
+        {
+            PerformKickCheckMethod(player);
+            return;
+        }
+
+        PerformKick(player, KickReason.ServerIsFull);
+    }
+
+    private int GetPublicSlots(int maxPlayers)
+    {
+        var visibleMaxPlayers = GetVisibleMaxPlayers();
+        if (visibleMaxPlayers.HasValue)
+            return Math.Max(0, visibleMaxPlayers.Value);
+
+        int publicSlots = maxPlayers - Config.reservedSlots;
+        return publicSlots < 0 ? 0 : publicSlots;
+    }
+
+    private void RefreshVisibleMaxPlayers()
+    {
+        var cvar = ConVar.Find("sv_visiblemaxplayers");
+        if (cvar == null)
+        {
+            _cachedVisibleMaxPlayers = null;
+            Logger.LogWarning("[Reserved Slots] Could not find convar 'sv_visiblemaxplayers'.");
+            return;
+        }
+
+        var value = cvar.GetPrimitiveValue<int>();
+
+        if (value < 0)
+        {
+            _cachedVisibleMaxPlayers = 0;
+            Logger.LogInformation("[Reserved Slots] sv_visiblemaxplayers is less than 0, treating it as 0.");
+            return;
+        }
+
+        _cachedVisibleMaxPlayers = value;
+        Logger.LogInformation("[Reserved Slots] Cached sv_visiblemaxplayers value: {Value}", _cachedVisibleMaxPlayers);
+    }
+
+    private int? GetVisibleMaxPlayers()
+    {
+        return _cachedVisibleMaxPlayers;
     }
 
     private CCSPlayerController? getPlayerToKick(CCSPlayerController client)
@@ -362,12 +452,21 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
 
     private static int GetPlayersCount()
     {
-        return Utilities.GetPlayers().Where(p => !p.IsHLTV && !p.IsBot && p.Connected == PlayerConnectedState.PlayerConnected && p.SteamID.ToString().Length == 17).Count();
+        return Utilities.GetPlayers().Count(p =>
+            !p.IsHLTV &&
+            !p.IsBot &&
+            p.Connected == PlayerConnectedState.PlayerConnected &&
+            p.SteamID.ToString().Length == 17);
     }
 
     private int GetPlayersCountWithReservationFlag()
     {
-        return Utilities.GetPlayers().Where(p => !p.IsHLTV && !p.IsBot && p.Connected == PlayerConnectedState.PlayerConnected && p.SteamID.ToString().Length == 17 && reservedPlayers.ContainsKey(p.Slot)).Count();
+        return Utilities.GetPlayers().Count(p =>
+            !p.IsHLTV &&
+            !p.IsBot &&
+            p.Connected == PlayerConnectedState.PlayerConnected &&
+            p.SteamID.ToString().Length == 17 &&
+            reservedPlayers.ContainsKey(p.Slot));
     }
 
     private static void SendConsoleMessage(string text, ConsoleColor color)
