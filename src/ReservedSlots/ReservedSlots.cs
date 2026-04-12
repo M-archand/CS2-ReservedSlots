@@ -72,27 +72,28 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
 
     public override void Load(bool hotReload)
     {
-        RefreshVisibleMaxPlayers();
-
         RegisterListener<Listeners.OnMapStart>(mapName =>
         {
-            RefreshVisibleMaxPlayers();
+            AddTimer(3.0f, () =>
+            {
+                RefreshVisibleMaxPlayers();
+            }, TimerFlags.STOP_ON_MAPCHANGE);
         });
 
         RegisterListener<Listeners.OnTick>(() =>
         {
-            if (waitingForKick.Count > 0)
+            if (waitingForKick.Count == 0)
+                return;
+
+            foreach (var item in waitingForKick.ToArray())
             {
-                foreach (var item in waitingForKick)
+                var player = Utilities.GetPlayerFromSlot(item.Key);
+                if (player != null && player.IsValid)
                 {
-                    var player = Utilities.GetPlayerFromSlot(item.Key);
-                    if (player != null && player.IsValid)
-                    {
-                        var kickMessage = item.Value == KickReason.ServerIsFull
-                            ? Localizer["Hud.ServerIsFull"]
-                            : Localizer["Hud.ReservedPlayerJoined"];
-                        player.PrintToCenterHtml(kickMessage);
-                    }
+                    var kickMessage = item.Value == KickReason.ServerIsFull
+                        ? Localizer["Hud.ServerIsFull"]
+                        : Localizer["Hud.ReservedPlayerJoined"];
+                    player.PrintToCenterHtml(kickMessage);
                 }
             }
         });
@@ -384,8 +385,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         var cvar = ConVar.Find("sv_visiblemaxplayers");
         if (cvar == null)
         {
-            _cachedVisibleMaxPlayers = null;
-            Logger.LogWarning("[Reserved Slots] Could not find convar 'sv_visiblemaxplayers'.");
+            Logger.LogWarning("[Reserved Slots] Could not find convar 'sv_visiblemaxplayers'. Keeping previous cached value: {Value}", _cachedVisibleMaxPlayers);
             return;
         }
 
@@ -393,8 +393,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
 
         if (value < 0)
         {
-            _cachedVisibleMaxPlayers = 0;
-            Logger.LogInformation("[Reserved Slots] sv_visiblemaxplayers is less than 0, treating it as 0.");
+            Logger.LogWarning("[Reserved Slots] sv_visiblemaxplayers returned {Value}. Keeping previous cached value: {CachedValue}", value, _cachedVisibleMaxPlayers);
             return;
         }
 
