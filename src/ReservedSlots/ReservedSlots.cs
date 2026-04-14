@@ -84,13 +84,14 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
             waitingForSelectTeam.Clear();
             waitingForKick.Clear();
             reservedPlayers.Clear();
-            _cachedVisibleMaxPlayers = null;
 
             AddTimer(3.0f, () =>
             {
                 RefreshVisibleMaxPlayers();
             }, TimerFlags.STOP_ON_MAPCHANGE);
         });
+
+        RefreshVisibleMaxPlayers();
 
         RegisterListener<Listeners.OnTick>(() =>
         {
