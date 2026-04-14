@@ -7,6 +7,7 @@ using System.Text.Json.Serialization;
 using CounterStrikeSharp.API.Modules.Timers;
 using Microsoft.Extensions.Logging;
 using CounterStrikeSharp.API.Modules.Cvars;
+using CounterStrikeSharp.API.ValveConstants.Protobuf;
 
 namespace ReservedSlots;
 
@@ -68,12 +69,23 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         Config = config;
         if (!Config.reservedFlags.Any())
             SendConsoleMessage("[Reserved Slots] Reserved Flags and Roles cannot be empty!", ConsoleColor.Red);
+
+        if (!Enum.IsDefined(typeof(NetworkDisconnectionReason), Config.kickReason))
+        {
+            SendConsoleMessage($"[Reserved Slots] Invalid 'Kick Reason' value {Config.kickReason}, falling back to 135 (NETWORK_DISCONNECT_KICKED_RESERVEDSLOT).", ConsoleColor.Yellow);
+            Config.kickReason = 135;
+        }
     }
 
     public override void Load(bool hotReload)
     {
         RegisterListener<Listeners.OnMapStart>(mapName =>
         {
+            waitingForSelectTeam.Clear();
+            waitingForKick.Clear();
+            reservedPlayers.Clear();
+            _cachedVisibleMaxPlayers = null;
+
             AddTimer(3.0f, () =>
             {
                 RefreshVisibleMaxPlayers();
@@ -279,15 +291,17 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         if (delay > 1)
         {
             var slot = player.Slot;
-            if (!waitingForKick.ContainsKey(slot))
-                waitingForKick.Add(slot, reason);
+            if (waitingForKick.ContainsKey(slot))
+                return;
+
+            waitingForKick.Add(slot, reason);
 
             AddTimer(delay, () =>
             {
                 player = Utilities.GetPlayerFromSlot(slot);
                 if (player != null && player.IsValid)
                 {
-                    player.Disconnect((CounterStrikeSharp.API.ValveConstants.Protobuf.NetworkDisconnectionReason)Config.kickReason);
+                    player.Disconnect((NetworkDisconnectionReason)Config.kickReason);
                     LogMessage(name, steamid, reason);
                 }
 
@@ -298,7 +312,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         }
         else
         {
-            player.Disconnect((CounterStrikeSharp.API.ValveConstants.Protobuf.NetworkDisconnectionReason)Config.kickReason);
+            player.Disconnect((NetworkDisconnectionReason)Config.kickReason);
             LogMessage(name, steamid, reason);
         }
     }
