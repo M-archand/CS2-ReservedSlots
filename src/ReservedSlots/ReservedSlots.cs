@@ -67,6 +67,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
     public ReservedSlotsConfig Config { get; set; } = new();
     private HashSet<string> _normalizedReservedFlags = new(StringComparer.Ordinal);
     private HashSet<string> _normalizedAdminFlags = new(StringComparer.Ordinal);
+    private HashSet<ulong> _playersWithInstructorEnabled = new();
     private int? _cachedVisibleMaxPlayers;
 
     public void OnConfigParsed(ReservedSlotsConfig config)
@@ -113,6 +114,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
     {
         RegisterListener<Listeners.OnMapStart>(mapName =>
         {
+            ResetTrackedGameInstructorStates();
             waitingForSelectTeam.Clear();
             waitingForKick.Clear();
             reservedPlayers.Clear();
@@ -180,6 +182,8 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
 
             if (immunePlayers.Contains(player.SteamID))
                 immunePlayers.Remove(player.SteamID);
+
+            SetGameInstructorState(player, enabled: false);
         }
 
         return HookResult.Continue;
@@ -577,6 +581,9 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
 
     private void ShowKickHint(CCSPlayerController player, KickReason reason, int delay)
     {
+        if (!player.IsValid)
+            return;
+
         var pawn = player.PlayerPawn?.Value;
         if (pawn == null || !pawn.IsValid)
             return;
@@ -590,18 +597,26 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         AddTimer(0.25f, () =>
         {
             if (!player.IsValid)
+            {
+                SetGameInstructorState(player, enabled: false);
                 return;
+            }
 
             var currentPawn = player.PlayerPawn?.Value;
             if (currentPawn == null || !currentPawn.IsValid)
+            {
+                SetGameInstructorState(player, enabled: false);
                 return;
+            }
 
             var hint = Utilities.CreateEntityByName<CEnvInstructorHint>("env_instructor_hint");
             if (hint == null)
+            {
+                SetGameInstructorState(player, enabled: false);
                 return;
+            }
 
             hint.Static = true;
-            hint.LocalPlayerOnly = true;
             hint.Caption = kickMessage;
             hint.Timeout = delay;
             hint.Icon_Onscreen = "icon_alert";
@@ -618,16 +633,56 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
 
             AddTimer(delay + 0.25f, () =>
             {
-                if (player.IsValid)
-                    SetGameInstructorState(player, enabled: false);
+                SetGameInstructorState(player, enabled: false);
             }, TimerFlags.STOP_ON_MAPCHANGE);
         }, TimerFlags.STOP_ON_MAPCHANGE);
     }
 
-    private static void SetGameInstructorState(CCSPlayerController player, bool enabled)
+    private void ResetTrackedGameInstructorStates()
     {
-        player.ReplicateConVar("sv_gameinstructor_disable", enabled ? "false" : "true");
-        player.ReplicateConVar("sv_gameinstructor_enable", enabled ? "true" : "false");
+        if (_playersWithInstructorEnabled.Count == 0)
+            return;
+
+        var hadTrackedPlayers = _playersWithInstructorEnabled.Count > 0;
+
+        foreach (var player in Utilities.GetPlayers().Where(IsHumanPlayer).Where(player => _playersWithInstructorEnabled.Contains(player.SteamID)))
+        {
+            SetGameInstructorState(player, enabled: false);
+        }
+
+        _playersWithInstructorEnabled.Clear();
+
+        if (hadTrackedPlayers)
+            Server.ExecuteCommand("sv_gameinstructor_disable true");
+    }
+
+    private void SetGameInstructorState(CCSPlayerController? player, bool enabled)
+    {
+        if (player == null)
+            return;
+
+        if (!player.IsValid)
+        {
+            if (!enabled)
+                _playersWithInstructorEnabled.Remove(player.SteamID);
+            return;
+        }
+
+        if (enabled)
+        {
+            if (_playersWithInstructorEnabled.Count == 0)
+                Server.ExecuteCommand("sv_gameinstructor_disable false");
+
+            player.ReplicateConVar("sv_gameinstructor_enable", "true");
+            _playersWithInstructorEnabled.Add(player.SteamID);
+            return;
+        }
+
+        _playersWithInstructorEnabled.Remove(player.SteamID);
+        player.ReplicateConVar("sv_gameinstructor_enable", "false");
+
+        if (_playersWithInstructorEnabled.Count == 0)
+            Server.ExecuteCommand("sv_gameinstructor_disable true");
     }
 
     private static void SendConsoleMessage(string text, ConsoleColor color)
