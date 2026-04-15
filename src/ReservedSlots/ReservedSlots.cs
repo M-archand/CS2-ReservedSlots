@@ -16,6 +16,7 @@ public class ReservedSlotsConfig : BasePluginConfig
 {
     [JsonPropertyName("Reserved Flags")] public List<string> reservedFlags { get; set; } = new() { "@css/reservation", "@css/vip" };
     [JsonPropertyName("Admin Reserved Flags")] public List<string> adminFlags { get; set; } = new() { "@css/ban", "@css/admin" };
+    [JsonPropertyName("Reserved Player Kick Cooldown")] public int reservedPlayerKickCooldown { get; set; } = 30;
     [JsonPropertyName("Reserved Slots")] public int reservedSlots { get; set; } = 1;
     [JsonPropertyName("Reserved Slots Method")] public int reservedSlotsMethod { get; set; } = 0;
     [JsonPropertyName("Leave One Slot Open")] public bool openSlot { get; set; } = false;
@@ -68,6 +69,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
     private HashSet<string> _normalizedReservedFlags = new(StringComparer.Ordinal);
     private HashSet<string> _normalizedAdminFlags = new(StringComparer.Ordinal);
     private HashSet<ulong> _playersWithInstructorEnabled = new();
+    private Dictionary<ulong, DateTime> _reservedKickCooldownExpirations = new();
     private int? _cachedVisibleMaxPlayers;
 
     public void OnConfigParsed(ReservedSlotsConfig config)
@@ -78,6 +80,12 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
 
         if (!Config.reservedFlags.Any())
             SendConsoleMessage("[Reserved Slots] Reserved Flags and Roles cannot be empty!", ConsoleColor.Red);
+
+        if (Config.reservedPlayerKickCooldown < 0)
+        {
+            Logger.LogWarning("[Reserved Slots] Invalid 'Reserved Player Kick Cooldown' value {Value}, falling back to 30 seconds.", Config.reservedPlayerKickCooldown);
+            Config.reservedPlayerKickCooldown = 30;
+        }
 
         if (!Enum.IsDefined(typeof(NetworkDisconnectionReason), Config.kickReason))
         {
@@ -114,6 +122,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
     {
         RegisterListener<Listeners.OnMapStart>(mapName =>
         {
+            PruneExpiredReservedKickCooldowns();
             ResetTrackedGameInstructorStates();
             waitingForSelectTeam.Clear();
             waitingForKick.Clear();
@@ -147,15 +156,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         if (player != null && player.IsValid && waitingForSelectTeam.Contains(player.SteamID))
         {
             waitingForSelectTeam.Remove(player.SteamID);
-            var kickedPlayer = getPlayerToKick(player);
-            if (kickedPlayer != null)
-            {
-                PerformKick(kickedPlayer, KickReason.ReservedPlayerJoined);
-            }
-            else
-            {
-                SendConsoleMessage(text: $"[Reserved Slots] Selected player is NULL, no one is kicked!", ConsoleColor.Red);
-            }
+            TryPerformReservedPlayerKick(player, GetPlayersReservedType(player));
         }
         return HookResult.Continue;
     }
@@ -169,9 +170,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
             if (waitingForSelectTeam.Contains(player.SteamID))
             {
                 waitingForSelectTeam.Remove(player.SteamID);
-                var kickedPlayer = getPlayerToKick(player);
-                if (kickedPlayer != null)
-                    PerformKick(kickedPlayer, KickReason.ReservedPlayerJoined);
+                TryPerformReservedPlayerKick(player, GetPlayersReservedType(player), denyJoinOnCooldown: false);
             }
 
             if (waitingForKick.ContainsKey(player.SteamID))
@@ -324,22 +323,19 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
 
     private void PerformKickCheckMethod(CCSPlayerController player, IEnumerable<CCSPlayerController> connectedHumanPlayers)
     {
+        var reservedType = GetPlayersReservedType(player);
+
         switch (Config.kickCheckMethod)
         {
             case 1:
+                if (!CanTriggerReservedKick(player, reservedType))
+                    return;
+
                 if (!waitingForSelectTeam.Contains(player.SteamID))
                     waitingForSelectTeam.Add(player.SteamID);
                 break;
             default:
-                var kickedPlayer = getPlayerToKick(player, connectedHumanPlayers);
-                if (kickedPlayer != null)
-                {
-                    PerformKick(kickedPlayer, KickReason.ReservedPlayerJoined);
-                }
-                else
-                {
-                    Logger.LogWarning("[Reserved Slots] Selected player is NULL, no one is kicked!");
-                }
+                TryPerformReservedPlayerKick(player, reservedType, connectedHumanPlayers);
                 break;
         }
     }
@@ -448,6 +444,96 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         }
 
         PerformKick(player, KickReason.ServerIsFull);
+    }
+
+    private bool TryPerformReservedPlayerKick(CCSPlayerController player, ReservedType reservedType, IEnumerable<CCSPlayerController>? connectedHumanPlayers = null, bool denyJoinOnCooldown = true)
+    {
+        if (!CanTriggerReservedKick(player, reservedType, denyJoinOnCooldown))
+            return false;
+
+        var kickedPlayer = connectedHumanPlayers == null
+            ? getPlayerToKick(player)
+            : getPlayerToKick(player, connectedHumanPlayers);
+
+        if (kickedPlayer == null)
+        {
+            Logger.LogWarning("[Reserved Slots] Selected player is NULL, no one is kicked!");
+            return false;
+        }
+
+        RecordReservedKickCooldown(player, reservedType);
+        PerformKick(kickedPlayer, KickReason.ReservedPlayerJoined);
+        return true;
+    }
+
+    private bool CanTriggerReservedKick(CCSPlayerController player, ReservedType reservedType, bool denyJoinOnCooldown = true)
+    {
+        if (reservedType == ReservedType.None)
+        {
+            Logger.LogWarning("[Reserved Slots] Player {Name} ({SteamID}) attempted reserved-slot kick without a reserved type.", player.PlayerName, player.SteamID);
+            return false;
+        }
+
+        if (reservedType != ReservedType.VIP)
+            return true;
+
+        if (!TryGetReservedKickCooldownRemaining(player.SteamID, out int remainingSeconds))
+            return true;
+
+        Logger.LogInformation("[Reserved Slots] Player {Name} ({SteamID}) with Reserved Flags cannot kick another player for {RemainingSeconds} more second(s).", player.PlayerName, player.SteamID, remainingSeconds);
+
+        if (denyJoinOnCooldown)
+            PerformKick(player, KickReason.ServerIsFull);
+
+        return false;
+    }
+
+    private void RecordReservedKickCooldown(CCSPlayerController player, ReservedType reservedType)
+    {
+        if (reservedType != ReservedType.VIP || Config.reservedPlayerKickCooldown <= 0)
+            return;
+
+        _reservedKickCooldownExpirations[player.SteamID] = DateTime.UtcNow.AddSeconds(Config.reservedPlayerKickCooldown);
+    }
+
+    private bool TryGetReservedKickCooldownRemaining(ulong steamId, out int remainingSeconds)
+    {
+        remainingSeconds = 0;
+
+        if (Config.reservedPlayerKickCooldown <= 0)
+            return false;
+
+        PruneExpiredReservedKickCooldowns();
+
+        if (!_reservedKickCooldownExpirations.TryGetValue(steamId, out var expiration))
+            return false;
+
+        var remaining = expiration - DateTime.UtcNow;
+        if (remaining <= TimeSpan.Zero)
+        {
+            _reservedKickCooldownExpirations.Remove(steamId);
+            return false;
+        }
+
+        remainingSeconds = (int)Math.Ceiling(remaining.TotalSeconds);
+        return true;
+    }
+
+    private void PruneExpiredReservedKickCooldowns()
+    {
+        if (_reservedKickCooldownExpirations.Count == 0)
+            return;
+
+        var now = DateTime.UtcNow;
+        var expiredSteamIds = _reservedKickCooldownExpirations
+            .Where(entry => entry.Value <= now)
+            .Select(entry => entry.Key)
+            .ToList();
+
+        foreach (var steamId in expiredSteamIds)
+        {
+            _reservedKickCooldownExpirations.Remove(steamId);
+        }
     }
 
     private int GetPublicSlots(int maxPlayers)
