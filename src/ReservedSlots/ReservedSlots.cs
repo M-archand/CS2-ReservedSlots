@@ -349,7 +349,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         var steamid = player.SteamID.ToString();
         int delay = GetKickDelay(reason);
 
-        if (delay > 1)
+        if (delay >= 1)
         {
             var playerSteamId = player.SteamID;
             if (waitingForKick.ContainsKey(playerSteamId))
@@ -489,39 +489,56 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
 
     private CCSPlayerController? getPlayerToKick(CCSPlayerController client, IEnumerable<CCSPlayerController> connectedHumanPlayers)
     {
-        var playersList = connectedHumanPlayers
-            .Where(p => p.PlayerPawn.IsValid && p != client && !waitingForKick.ContainsKey(p.SteamID) && !immunePlayers.Contains(p.SteamID))
-            .Select(player => (player, (int)player.Ping, player.Score, player.Team))
-            .ToList();
+        CCSPlayerController? spectatorCandidate = null;
+        CCSPlayerController? fallbackCandidate = null;
+        int spectatorCandidatesSeen = 0;
+        int fallbackCandidatesSeen = 0;
 
-        if (Config.kickPlayersInSpectate)
+        foreach (var player in connectedHumanPlayers)
         {
-            if (playersList.Count(x => x.Team == CsTeam.None || x.Team == CsTeam.Spectator) > 0)
-                playersList.RemoveAll(x => x.Team != CsTeam.None && x.Team != CsTeam.Spectator);
+            if (!player.PlayerPawn.IsValid || player == client || waitingForKick.ContainsKey(player.SteamID) || immunePlayers.Contains(player.SteamID))
+                continue;
+
+            if (Config.kickPlayersInSpectate && IsSpectatorCandidate(player))
+                EvaluateKickCandidate(player, ref spectatorCandidate, ref spectatorCandidatesSeen);
+            else
+                EvaluateKickCandidate(player, ref fallbackCandidate, ref fallbackCandidatesSeen);
         }
 
-        if (playersList.Count == 0)
-            return null;
+        return spectatorCandidate ?? fallbackCandidate;
+    }
+
+    private void EvaluateKickCandidate(CCSPlayerController player, ref CCSPlayerController? currentCandidate, ref int candidatesSeen)
+    {
+        candidatesSeen++;
 
         switch (Config.kickType)
         {
             case (int)KickType.HighestPing:
-                playersList.Sort((x, y) => y.player.Ping.CompareTo(x.player.Ping));
+                if (currentCandidate == null || player.Ping > currentCandidate.Ping)
+                    currentCandidate = player;
                 break;
 
             case (int)KickType.HighestScore:
-                playersList.Sort((x, y) => y.player.Score.CompareTo(x.player.Score));
+                if (currentCandidate == null || player.Score > currentCandidate.Score)
+                    currentCandidate = player;
                 break;
 
             case (int)KickType.LowestScore:
-                playersList.Sort((x, y) => x.player.Score.CompareTo(y.player.Score));
+                if (currentCandidate == null || player.Score < currentCandidate.Score)
+                    currentCandidate = player;
                 break;
 
             default:
-                return playersList[Random.Shared.Next(playersList.Count)].player;
+                if (Random.Shared.Next(candidatesSeen) == 0)
+                    currentCandidate = player;
+                break;
         }
+    }
 
-        return playersList[0].player;
+    private static bool IsSpectatorCandidate(CCSPlayerController player)
+    {
+        return player.Team == CsTeam.None || player.Team == CsTeam.Spectator;
     }
 
     private static bool IsHumanPlayer(CCSPlayerController player)
