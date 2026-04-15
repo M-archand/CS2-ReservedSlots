@@ -8,6 +8,7 @@ using CounterStrikeSharp.API.Modules.Timers;
 using Microsoft.Extensions.Logging;
 using CounterStrikeSharp.API.Modules.Cvars;
 using CounterStrikeSharp.API.ValveConstants.Protobuf;
+using System.Drawing;
 
 namespace ReservedSlots;
 
@@ -116,24 +117,14 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         });
 
         RefreshVisibleMaxPlayers();
+    }
 
-        RegisterListener<Listeners.OnTick>(() =>
-        {
-            if (waitingForKick.Count == 0)
-                return;
-
-            foreach (var item in waitingForKick.ToArray())
-            {
-                var player = Utilities.GetPlayerFromSlot(item.Key);
-                if (player != null && player.IsValid)
-                {
-                    var kickMessage = item.Value == KickReason.ServerIsFull
-                        ? Localizer["Hud.ServerIsFull"]
-                        : Localizer["Hud.ReservedPlayerJoined"];
-                    player.PrintToCenterHtml(kickMessage);
-                }
-            }
-        });
+    [GameEventHandler]
+    public HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
+    {
+        if (_cachedVisibleMaxPlayers == null)
+            RefreshVisibleMaxPlayers();
+        return HookResult.Continue;
     }
 
     [GameEventHandler(HookMode.Pre)]
@@ -325,6 +316,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
                 return;
 
             waitingForKick.Add(slot, reason);
+            ShowKickHint(player, reason, delay);
 
             AddTimer(delay, () =>
             {
@@ -510,6 +502,57 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
             p.Connected == PlayerConnectedState.PlayerConnected &&
             p.SteamID.ToString().Length == 17 &&
             GetPlayersReservedType(p) != ReservedType.None);
+    }
+
+    private void ShowKickHint(CCSPlayerController player, KickReason reason, int delay)
+    {
+        var pawn = player.PlayerPawn?.Value;
+        if (pawn == null || !pawn.IsValid)
+            return;
+
+        var kickMessage = reason == KickReason.ServerIsFull
+            ? Localizer["Hud.ServerIsFull"]
+            : Localizer["Hud.ReservedPlayerJoined"];
+
+        Server.ExecuteCommand("sv_gameinstructor_disable false");
+        player.ReplicateConVar("sv_gameinstructor_enable", "true");
+
+        AddTimer(0.25f, () =>
+        {
+            if (!player.IsValid)
+                return;
+
+            var currentPawn = player.PlayerPawn?.Value;
+            if (currentPawn == null || !currentPawn.IsValid)
+                return;
+
+            var hint = Utilities.CreateEntityByName<CEnvInstructorHint>("env_instructor_hint");
+            if (hint == null)
+                return;
+
+            hint.Static = true;
+            hint.Caption = kickMessage;
+            hint.Timeout = delay;
+            hint.Icon_Onscreen = "icon_bulb";
+            hint.Icon_Offscreen = "icon_arrow_up";
+            hint.Binding = "";
+            hint.Color = Color.FromArgb(255, 255, 100, 0);
+            hint.Range = 0f;
+            hint.NoOffscreen = true;
+            hint.ForceCaption = true;
+
+            hint.DispatchSpawn();
+            hint.AcceptInput("ShowHint", currentPawn, currentPawn);
+
+            AddTimer(delay + 0.25f, () =>
+            {
+                if (hint.IsValid)
+                    hint.AcceptInput("Kill");
+
+                if (player.IsValid)
+                    player.ReplicateConVar("sv_gameinstructor_enable", "false");
+            }, TimerFlags.STOP_ON_MAPCHANGE);
+        }, TimerFlags.STOP_ON_MAPCHANGE);
     }
 
     private static void SendConsoleMessage(string text, ConsoleColor color)
