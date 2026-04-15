@@ -42,7 +42,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         HighestPing,
         HighestScore,
         LowestScore,
-        //HighestTime,
+        HighestTime,
     }
 
     public enum KickReason
@@ -72,8 +72,32 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
 
         if (!Enum.IsDefined(typeof(NetworkDisconnectionReason), Config.kickReason))
         {
-            SendConsoleMessage($"[Reserved Slots] Invalid 'Kick Reason' value {Config.kickReason}, falling back to 135 (NETWORK_DISCONNECT_KICKED_RESERVEDSLOT).", ConsoleColor.Yellow);
+            Logger.LogWarning("[Reserved Slots] Invalid 'Kick Reason' value {Value}, falling back to 135 (NETWORK_DISCONNECT_KICKED_RESERVEDSLOT).", Config.kickReason);
             Config.kickReason = 135;
+        }
+
+        if (Config.reservedSlotsMethod < 0 || Config.reservedSlotsMethod > 3)
+        {
+            Logger.LogWarning("[Reserved Slots] Invalid 'Reserved Slots Method' value {Value} (valid: 0-3), falling back to 0.", Config.reservedSlotsMethod);
+            Config.reservedSlotsMethod = 0;
+        }
+
+        if (Config.kickImmunity < 0 || Config.kickImmunity > 2)
+        {
+            Logger.LogWarning("[Reserved Slots] Invalid 'Kick Immunity Type' value {Value} (valid: 0-2), falling back to 0.", Config.kickImmunity);
+            Config.kickImmunity = 0;
+        }
+
+        if (!Enum.IsDefined(typeof(KickType), Config.kickType))
+        {
+            Logger.LogWarning("[Reserved Slots] Invalid 'Kick Type' value {Value} (valid: 0-4), falling back to 0 (Random).", Config.kickType);
+            Config.kickType = 0;
+        }
+
+        if (Config.displayKickedPlayers < 0 || Config.displayKickedPlayers > 2)
+        {
+            Logger.LogWarning("[Reserved Slots] Invalid 'Display Kicked Players Message' value {Value} (valid: 0-2), falling back to 2.", Config.displayKickedPlayers);
+            Config.displayKickedPlayers = 2;
         }
     }
 
