@@ -61,14 +61,20 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
 
     public HashSet<ulong> waitingForSelectTeam = new();
 
-    public Dictionary<int, bool> reservedPlayers = new();
+    public HashSet<ulong> reservedPlayers = new();
+    public HashSet<ulong> immunePlayers = new();
     public Dictionary<ulong, KickReason> waitingForKick = new();
     public ReservedSlotsConfig Config { get; set; } = new();
+    private HashSet<string> _normalizedReservedFlags = new(StringComparer.Ordinal);
+    private HashSet<string> _normalizedAdminFlags = new(StringComparer.Ordinal);
     private int? _cachedVisibleMaxPlayers;
 
     public void OnConfigParsed(ReservedSlotsConfig config)
     {
         Config = config;
+        _normalizedReservedFlags = NormalizeFlags(Config.reservedFlags);
+        _normalizedAdminFlags = NormalizeFlags(Config.adminFlags);
+
         if (!Config.reservedFlags.Any())
             SendConsoleMessage("[Reserved Slots] Reserved Flags and Roles cannot be empty!", ConsoleColor.Red);
 
@@ -110,6 +116,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
             waitingForSelectTeam.Clear();
             waitingForKick.Clear();
             reservedPlayers.Clear();
+            immunePlayers.Clear();
 
             AddTimer(3.0f, () =>
             {
@@ -168,8 +175,11 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
             if (waitingForKick.ContainsKey(player.SteamID))
                 waitingForKick.Remove(player.SteamID);
 
-            if (reservedPlayers.ContainsKey(player.Slot))
-                reservedPlayers.Remove(player.Slot);
+            if (reservedPlayers.Contains(player.SteamID))
+                reservedPlayers.Remove(player.SteamID);
+
+            if (immunePlayers.Contains(player.SteamID))
+                immunePlayers.Remove(player.SteamID);
         }
 
         return HookResult.Continue;
@@ -181,7 +191,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         var player = @event.Userid;
         if (player != null && IsHumanPlayer(player))
         {
-            if (Config.adminFlags.Count == 0 && Config.reservedFlags.Count == 0)
+            if (_normalizedAdminFlags.Count == 0 && _normalizedReservedFlags.Count == 0)
                 return HookResult.Continue;
 
             waitingForSelectTeam.Remove(player.SteamID);
@@ -251,46 +261,49 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         if (!playerFlags.Any())
             return ReservedType.None;
 
-        if (Config.adminFlags.Any())
+        if (_normalizedAdminFlags.Count > 0)
         {
-            var reservedFlags = Config.adminFlags
-                .Where(item => !ulong.TryParse(item, out _))
-                .ToHashSet();
-
-            if (playerFlags.Any(flag => reservedFlags.Contains(flag)))
+            if (playerFlags.Any(flag => _normalizedAdminFlags.Contains(flag)))
                 return ReservedType.Admin;
         }
 
-        if (Config.reservedFlags.Any())
+        if (_normalizedReservedFlags.Count > 0)
         {
-            var reservedFlags = Config.reservedFlags
-                .Where(item => !ulong.TryParse(item, out _))
-                .ToHashSet();
-
-            if (playerFlags.Any(flag => reservedFlags.Contains(flag)))
+            if (playerFlags.Any(flag => _normalizedReservedFlags.Contains(flag)))
                 return ReservedType.VIP;
         }
 
         return ReservedType.None;
     }
 
+    private static HashSet<string> NormalizeFlags(IEnumerable<string> flags)
+    {
+        return flags
+            .Where(item => !ulong.TryParse(item, out _))
+            .ToHashSet(StringComparer.Ordinal);
+    }
+
     public void SetKickImmunity(CCSPlayerController player, ReservedType type)
     {
-        if (reservedPlayers.ContainsKey(player.Slot))
-            return;
-
         bool isImmune = Config.kickImmunity switch
         {
             1 => type == ReservedType.Admin,
             2 => type == ReservedType.VIP,
             _ => type == ReservedType.Admin || type == ReservedType.VIP
         };
-        reservedPlayers.Add(player.Slot, isImmune);
+
+        reservedPlayers.Add(player.SteamID);
+
+        if (isImmune)
+            immunePlayers.Add(player.SteamID);
+        else
+            immunePlayers.Remove(player.SteamID);
     }
 
     private void RebuildReservedPlayersCache()
     {
         reservedPlayers.Clear();
+        immunePlayers.Clear();
 
         foreach (var player in Utilities.GetPlayers().Where(IsHumanPlayer))
         {
@@ -477,7 +490,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
     private CCSPlayerController? getPlayerToKick(CCSPlayerController client, IEnumerable<CCSPlayerController> connectedHumanPlayers)
     {
         var playersList = connectedHumanPlayers
-            .Where(p => p.PlayerPawn.IsValid && p != client && !waitingForKick.ContainsKey(p.SteamID) && (!reservedPlayers.ContainsKey(p.Slot) || (reservedPlayers.ContainsKey(p.Slot) && reservedPlayers[p.Slot] == false)))
+            .Where(p => p.PlayerPawn.IsValid && p != client && !waitingForKick.ContainsKey(p.SteamID) && !immunePlayers.Contains(p.SteamID))
             .Select(player => (player, (int)player.Ping, player.Score, player.Team))
             .ToList();
 
@@ -487,33 +500,28 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
                 playersList.RemoveAll(x => x.Team != CsTeam.None && x.Team != CsTeam.Spectator);
         }
 
-        if (!playersList.Any())
+        if (playersList.Count == 0)
             return null;
 
-        CCSPlayerController? player = null;
         switch (Config.kickType)
         {
             case (int)KickType.HighestPing:
                 playersList.Sort((x, y) => y.player.Ping.CompareTo(x.player.Ping));
-                player = playersList.FirstOrDefault().player;
                 break;
 
             case (int)KickType.HighestScore:
                 playersList.Sort((x, y) => y.player.Score.CompareTo(x.player.Score));
-                player = playersList.FirstOrDefault().player;
                 break;
 
             case (int)KickType.LowestScore:
                 playersList.Sort((x, y) => x.player.Score.CompareTo(y.player.Score));
-                player = playersList.FirstOrDefault().player;
                 break;
 
             default:
-                playersList = playersList.OrderBy(x => Guid.NewGuid()).ToList();
-                player = playersList.FirstOrDefault().player;
-                break;
+                return playersList[Random.Shared.Next(playersList.Count)].player;
         }
-        return player;
+
+        return playersList[0].player;
     }
 
     private static bool IsHumanPlayer(CCSPlayerController player)
@@ -547,7 +555,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
 
     private int GetPlayersCountWithReservationFlag(IEnumerable<CCSPlayerController> connectedHumanPlayers)
     {
-        return connectedHumanPlayers.Count(p => reservedPlayers.ContainsKey(p.Slot));
+        return connectedHumanPlayers.Count(p => reservedPlayers.Contains(p.SteamID));
     }
 
     private void ShowKickHint(CCSPlayerController player, KickReason reason, int delay)
