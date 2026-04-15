@@ -34,6 +34,8 @@ public class ReservedSlotsConfig : BasePluginConfig
 
 public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
 {
+    private readonly record struct PendingKickState(KickReason Reason, long Token);
+
     public override string ModuleName => "Reserved Slots";
     public override string ModuleAuthor => "Nocky (SourceFactory.eu)";
     public override string ModuleVersion => "1.2.0";
@@ -60,16 +62,17 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         None
     }
 
-    public HashSet<ulong> waitingForSelectTeam = new();
+    private HashSet<ulong> waitingForSelectTeam = new();
 
-    public HashSet<ulong> reservedPlayers = new();
-    public HashSet<ulong> immunePlayers = new();
-    public Dictionary<ulong, KickReason> waitingForKick = new();
+    private HashSet<ulong> reservedPlayers = new();
+    private HashSet<ulong> immunePlayers = new();
+    private Dictionary<ulong, PendingKickState> waitingForKick = new();
     public ReservedSlotsConfig Config { get; set; } = new();
     private HashSet<string> _normalizedReservedFlags = new(StringComparer.Ordinal);
     private HashSet<string> _normalizedAdminFlags = new(StringComparer.Ordinal);
     private HashSet<ulong> _playersWithInstructorEnabled = new();
     private Dictionary<ulong, DateTime> _reservedKickCooldownExpirations = new();
+    private long _pendingKickSequence;
     private int? _cachedVisibleMaxPlayers;
 
     public void OnConfigParsed(ReservedSlotsConfig config)
@@ -124,10 +127,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         {
             PruneExpiredReservedKickCooldowns();
             ResetTrackedGameInstructorStates();
-            waitingForSelectTeam.Clear();
-            waitingForKick.Clear();
-            reservedPlayers.Clear();
-            immunePlayers.Clear();
+            ResetTransientPlayerState();
 
             AddTimer(3.0f, () =>
             {
@@ -153,9 +153,8 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
     public HookResult OnPlayerTeam(EventPlayerTeam @event, GameEventInfo info)
     {
         var player = @event.Userid;
-        if (player != null && player.IsValid && waitingForSelectTeam.Contains(player.SteamID))
+        if (player != null && player.IsValid && TryConsumeWaitingForTeamSelection(player.SteamID))
         {
-            waitingForSelectTeam.Remove(player.SteamID);
             TryPerformReservedPlayerKick(player, GetPlayersReservedType(player));
         }
         return HookResult.Continue;
@@ -167,21 +166,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         var player = @event.Userid;
         if (player != null && player.IsValid)
         {
-            if (waitingForSelectTeam.Contains(player.SteamID))
-            {
-                waitingForSelectTeam.Remove(player.SteamID);
-                TryPerformReservedPlayerKick(player, GetPlayersReservedType(player), denyJoinOnCooldown: false);
-            }
-
-            if (waitingForKick.ContainsKey(player.SteamID))
-                waitingForKick.Remove(player.SteamID);
-
-            if (reservedPlayers.Contains(player.SteamID))
-                reservedPlayers.Remove(player.SteamID);
-
-            if (immunePlayers.Contains(player.SteamID))
-                immunePlayers.Remove(player.SteamID);
-
+            ClearTrackedPlayerState(player.SteamID);
             SetGameInstructorState(player, enabled: false);
         }
 
@@ -197,13 +182,11 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
             if (_normalizedAdminFlags.Count == 0 && _normalizedReservedFlags.Count == 0)
                 return HookResult.Continue;
 
-            waitingForSelectTeam.Remove(player.SteamID);
-            waitingForKick.Remove(player.SteamID);
+            ClearPendingAdmissionState(player.SteamID);
 
             int maxPlayers = Server.MaxPlayers;
             var playerReservedType = GetPlayersReservedType(player);
-            if (playerReservedType == ReservedType.VIP || playerReservedType == ReservedType.Admin)
-                SetKickImmunity(player, playerReservedType);
+            UpdateReservationTracking(player, playerReservedType);
 
             var connectedHumanPlayers = GetConnectedHumanPlayers();
             int totalPlayers = GetPlayersCount(connectedHumanPlayers);
@@ -286,8 +269,50 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
             .ToHashSet(StringComparer.Ordinal);
     }
 
-    public void SetKickImmunity(CCSPlayerController player, ReservedType type)
+    private void ResetTransientPlayerState()
     {
+        waitingForSelectTeam.Clear();
+        waitingForKick.Clear();
+        reservedPlayers.Clear();
+        immunePlayers.Clear();
+    }
+
+    private void ClearPendingAdmissionState(ulong steamId)
+    {
+        waitingForSelectTeam.Remove(steamId);
+        ClearPendingKick(steamId);
+    }
+
+    private void ClearReservationTracking(ulong steamId)
+    {
+        reservedPlayers.Remove(steamId);
+        immunePlayers.Remove(steamId);
+    }
+
+    private void ClearTrackedPlayerState(ulong steamId)
+    {
+        ClearPendingAdmissionState(steamId);
+        ClearReservationTracking(steamId);
+    }
+
+    private bool TryConsumeWaitingForTeamSelection(ulong steamId)
+    {
+        return waitingForSelectTeam.Remove(steamId);
+    }
+
+    private void TrackWaitingForTeamSelection(ulong steamId)
+    {
+        waitingForSelectTeam.Add(steamId);
+    }
+
+    private void UpdateReservationTracking(CCSPlayerController player, ReservedType type)
+    {
+        if (type == ReservedType.None)
+        {
+            ClearReservationTracking(player.SteamID);
+            return;
+        }
+
         bool isImmune = Config.kickImmunity switch
         {
             1 => type == ReservedType.Admin,
@@ -311,8 +336,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         foreach (var player in Utilities.GetPlayers().Where(IsHumanPlayer))
         {
             var playerReservedType = GetPlayersReservedType(player);
-            if (playerReservedType != ReservedType.None)
-                SetKickImmunity(player, playerReservedType);
+            UpdateReservationTracking(player, playerReservedType);
         }
     }
 
@@ -331,8 +355,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
                 if (!CanTriggerReservedKick(player, reservedType))
                     return;
 
-                if (!waitingForSelectTeam.Contains(player.SteamID))
-                    waitingForSelectTeam.Add(player.SteamID);
+                TrackWaitingForTeamSelection(player.SteamID);
                 break;
             default:
                 TryPerformReservedPlayerKick(player, reservedType, connectedHumanPlayers);
@@ -352,14 +375,16 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         if (delay >= 1)
         {
             var playerSteamId = player.SteamID;
-            if (waitingForKick.ContainsKey(playerSteamId))
+            if (!TryStartPendingKick(playerSteamId, reason, out var pendingKick))
                 return;
 
-            waitingForKick.Add(playerSteamId, reason);
             ShowKickHint(player, reason, delay);
 
             AddTimer(delay, () =>
             {
+                if (!IsCurrentPendingKick(playerSteamId, pendingKick))
+                    return;
+
                 var delayedPlayer = Utilities.GetPlayers().FirstOrDefault(p => IsHumanPlayer(p) && p.SteamID == playerSteamId);
                 if (delayedPlayer != null && delayedPlayer.IsValid)
                 {
@@ -367,9 +392,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
                     LogMessage(name, steamid, reason);
                 }
 
-                if (waitingForKick.ContainsKey(playerSteamId))
-                    waitingForKick.Remove(playerSteamId);
-
+                ClearPendingKick(playerSteamId, pendingKick);
             }, TimerFlags.STOP_ON_MAPCHANGE);
         }
         else
@@ -464,6 +487,35 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         RecordReservedKickCooldown(player, reservedType);
         PerformKick(kickedPlayer, KickReason.ReservedPlayerJoined);
         return true;
+    }
+
+    private bool TryStartPendingKick(ulong steamId, KickReason reason, out PendingKickState pendingKick)
+    {
+        if (waitingForKick.ContainsKey(steamId))
+        {
+            pendingKick = default;
+            return false;
+        }
+
+        pendingKick = new PendingKickState(reason, ++_pendingKickSequence);
+        waitingForKick[steamId] = pendingKick;
+        return true;
+    }
+
+    private bool IsCurrentPendingKick(ulong steamId, PendingKickState pendingKick)
+    {
+        return waitingForKick.TryGetValue(steamId, out var currentPendingKick) && currentPendingKick == pendingKick;
+    }
+
+    private void ClearPendingKick(ulong steamId, PendingKickState? expectedPendingKick = null)
+    {
+        if (!waitingForKick.TryGetValue(steamId, out var currentPendingKick))
+            return;
+
+        if (expectedPendingKick.HasValue && currentPendingKick != expectedPendingKick.Value)
+            return;
+
+        waitingForKick.Remove(steamId);
     }
 
     private bool CanTriggerReservedKick(CCSPlayerController player, ReservedType reservedType, bool denyJoinOnCooldown = true)
