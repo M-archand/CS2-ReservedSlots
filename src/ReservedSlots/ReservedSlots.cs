@@ -454,7 +454,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
     {
         var allPlayers = Utilities.GetPlayers();
         var playersList = allPlayers
-            .Where(p => !p.IsBot && !p.IsHLTV && p.PlayerPawn.IsValid && p.Connected == PlayerConnectedState.PlayerConnected && p.SteamID.ToString().Length == 17 && p != client && (!reservedPlayers.ContainsKey(p.Slot) || (reservedPlayers.ContainsKey(p.Slot) && reservedPlayers[p.Slot] == false)))
+            .Where(p => !p.IsBot && !p.IsHLTV && p.PlayerPawn.IsValid && p.Connected == PlayerConnectedState.PlayerConnected && p.SteamID.ToString().Length == 17 && p != client && !waitingForKick.ContainsKey(p.Slot) && (!reservedPlayers.ContainsKey(p.Slot) || (reservedPlayers.ContainsKey(p.Slot) && reservedPlayers[p.Slot] == false)))
             .Select(player => (player, (int)player.Ping, player.Score, player.Team))
             .ToList();
 
@@ -509,7 +509,7 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
             !p.IsBot &&
             p.Connected == PlayerConnectedState.PlayerConnected &&
             p.SteamID.ToString().Length == 17 &&
-            reservedPlayers.ContainsKey(p.Slot));
+            GetPlayersReservedType(p) != ReservedType.None);
     }
 
     private static void SendConsoleMessage(string text, ConsoleColor color)
