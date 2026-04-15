@@ -163,7 +163,12 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
         if (player != null && player.IsValid)
         {
             if (waitingForSelectTeam.Contains(player.Slot))
+            {
                 waitingForSelectTeam.Remove(player.Slot);
+                var kickedPlayer = getPlayerToKick(player);
+                if (kickedPlayer != null)
+                    PerformKick(kickedPlayer, KickReason.ReservedPlayerJoined);
+            }
 
             if (waitingForKick.ContainsKey(player.Slot))
                 waitingForKick.Remove(player.Slot);
