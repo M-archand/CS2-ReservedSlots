@@ -328,10 +328,10 @@ public class ReservedSlots : BasePlugin, IPluginConfig<ReservedSlotsConfig>
 
             AddTimer(delay, () =>
             {
-                player = Utilities.GetPlayerFromSlot(slot);
-                if (player != null && player.IsValid)
+                var delayedPlayer = Utilities.GetPlayerFromSlot(slot);
+                if (delayedPlayer != null && delayedPlayer.IsValid)
                 {
-                    player.Disconnect((NetworkDisconnectionReason)Config.kickReason);
+                    delayedPlayer.Disconnect((NetworkDisconnectionReason)Config.kickReason);
                     LogMessage(name, steamid, reason);
                 }
 
